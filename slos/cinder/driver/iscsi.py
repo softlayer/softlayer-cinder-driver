@@ -6,23 +6,18 @@ Volume driver for SoftLayer storage systems.
 
 """
 
-import time
-import uuid
-
 from oslo.config import cfg
 
 from cinder import exception
 from cinder import utils
-from cinder.openstack.common import lockutils
 from cinder.openstack.common import log as logging
-from cinder.exception import VolumeBackendAPIException, InvalidSnapshot
+from cinder.exception import VolumeBackendAPIException
 from cinder.volume import driver
 from cinder import db
 from cinder import context
 from slos.cinder.driver.api import SLClient
 from slos.cinder.driver.iscsipool import IscsiPool
 from cinder.volume import utils as volume_utils
-from cinder.volume import volume_types
 
 LOG = logging.getLogger(__name__)
 
@@ -65,7 +60,7 @@ sl_opts = [
 class SoftLayerISCSIDriver(driver.ISCSIDriver):
 
     """SoftLayer iSCSI volume driver. Implements the driver API
-    for SoftLayer iSCSI volume service. The volumes created using 
+    for SoftLayer iSCSI volume service. The volumes created using
     this driver, will be created in SoftLayer.
     """
 
@@ -127,7 +122,7 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
 
     def create_volume(self, volume):
         """Driver entry point for creating a new volume.
-        
+
         Creates a new iSCSI volume, waits for it to become available.
         Once available, update the VolumeAdminMetadata with SoftLayer
         iSCSI storage ID. If volume is create with metadada
@@ -143,7 +138,9 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
         if not 'display_name' in model_update:
             LOG.debug('display_name is not updated by create')
             return model_update
-        if not self.configuration.sl_use_name in ('metadata', 'none', 'display_name'):
+        if not self.configuration.sl_use_name in ('metadata',
+                                                  'none',
+                                                  'display_name'):
             LOG.warn(_("Configuration variable 'sl_use_name'"
                        " must have one of the three values: 'metadata', 'none', 'display_name'."
                        " Has %s. Assuming none instead." % self.configuration.sl_use_name))
@@ -154,8 +151,10 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
             update_meta = db.volume_metadata_update
         if self.configuration.sl_use_name == 'metadata':
             admin_context = context.get_admin_context()
-            update_meta(
-                admin_context, vol_id, {'SL_iSCSI_Name': model_update['display_name']}, False)
+            update_meta(admin_context,
+                        vol_id,
+                        {'SL_iSCSI_Name': model_update['display_name']},
+                        False)
             del model_update['display_name']
         elif self.configuration.sl_use_name == 'none':
             del model_update['display_name']
@@ -163,11 +162,11 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
 
     def delete_volume(self, volume):
         """Driver entry point for destroying existing volumes.
-        
-        If the iSCSI storage is created using driver then
-        iSCSI storage cancel request is raised. 
 
-        If the iSCSI storage is just liked with this volume using 
+        If the iSCSI storage is created using driver then
+        iSCSI storage cancel request is raised.
+
+        If the iSCSI storage is just liked with this volume using
         `softlayer_volume_id` while creation, then the iSCSI storage
         remains.
         """
@@ -181,17 +180,13 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
 
     def ensure_export(self, context, volume):
         """Driver entry point to get the export info for an existing volume."""
-        return (
-            {'provider_location':
-                self.client.get_export(self.client._find_sl_vol_id(volume['id']))}
-        )
+        return {'provider_location': self.client.get_export(
+                self.client._find_sl_vol_id(volume['id']))}
 
     def create_export(self, context, volume):
         """Driver entry point to get the export info for a new volume."""
-        return (
-            {'provider_location':
-                self.client.get_export(self.client._find_sl_vol_id(volume['id']))}
-        )
+        return {'provider_location': self.client.get_export(
+                self.client._find_sl_vol_id(volume['id']))}
 
     def remove_export(self, context, volume):
         """Driver exntry point to remove an export for a volume.
@@ -204,7 +199,7 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
     def initialize_connection(self, volume, connector):
         """Driver entry point to attach a volume to an instance.
 
-        Find the username and password of the iSCSI storage using 
+        Find the username and password of the iSCSI storage using
         SoftLayer Services. Then using iSCSI initiator tool discrover
         the IQL of the iSCSI storage so as to be able to attach it.
         """
@@ -229,8 +224,8 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
     def create_snapshot(self, snapshot):
         """Driver entry point for creating a snapshot.
 
-        If the iSCSI storage has space for new snapshots 
-        then create new snapshot. Otherwise, order 
+        If the iSCSI storage has space for new snapshots
+        then create new snapshot. Otherwise, order
         snapshot space and then create snapshot.
         """
         volume = snapshot['volume']
@@ -255,10 +250,11 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
     def create_volume_from_snapshot(self, volume, snapshot):
         """Driver entry point for creating a new volume from a snapshot.
 
-        Since, Snapshot is available as iSCSI storage in SoftLayer 
+        Since, Snapshot is available as iSCSI storage in SoftLayer
         we copy the contents into new volume.
         """
-        sl_snap_id = self._find_sl_snapshot_id(snapshot['volume']['id'], snapshot['id'])
+        sl_snap_id = self._find_sl_snapshot_id(snapshot['volume']['id'],
+                                               snapshot['id'])
         model_update = self._create_copy(volume, sl_snap_id)
         model_update = self._check_display_name(volume['id'], model_update)
         return model_update
@@ -278,7 +274,7 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
 
     def create_cloned_volume(self, volume, src_vref):
         """Creates clone of an existing volume.
-        
+
         1. Create a new iSCSI storage.
         2. Attach it.
         3. Attach the source volume.
@@ -314,7 +310,7 @@ class SoftLayerISCSIDriver(driver.ISCSIDriver):
             LOG.error(
                 "Unable to attach the source volume. Deleting newly created volume.")
             self._detach_volume(dest_attach_info)
-            self.client.delete(delete)
+            self.client.delete(volume)
             raise
         try:
             LOG.debug(

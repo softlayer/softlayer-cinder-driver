@@ -18,8 +18,11 @@ class IscsiPool(api.SLClient):
         super(IscsiPool, self).__init__(*args, **kwargs)
 
     def local_volume_references(self, cntx):
-        all_vols = db.volume_get_all(
-            cntx, marker=None, limit=None, sort_key='created_at', sort_dir='desc')
+        all_vols = db.volume_get_all(cntx,
+                                     marker=None,
+                                     limit=None,
+                                     sort_key='created_at',
+                                     sort_dir='desc')
         return [vol['id'] for vol in all_vols]
 
     def find_free_volume(self, size):
@@ -30,8 +33,8 @@ class IscsiPool(api.SLClient):
         else:
             _filter['iscsiNetworkStorage']['capacityGb'] = query_filter(size)
         sl_volumes = self.client['Account'].getIscsiNetworkStorage(
-                mask='mask[id,capacityGb,username,password,billingItem[id]]',
-                filter=_filter.to_dict())
+            mask='mask[id,capacityGb,username,password,billingItem[id]]',
+            filter=_filter.to_dict())
         if len(sl_volumes) == 0:
             return (None, None)
         sl_volumes = sorted(sl_volumes, key=lambda x: int(x['capacityGb']))
@@ -67,8 +70,9 @@ class IscsiPool(api.SLClient):
             _("Create volume called with name: %s, size: %s, id: %s" %
               (volume['display_name'], volume['size'], volume['id'])))
         if 'softlayer_volume_id' in metadata:
-            if self.is_in_use(metdata['softlayer_volume_id']):
-                raise exception.InvalidVolume(reason="Volume requested is already is in user")
+            if self.is_in_use(metadata['softlayer_volume_id']):
+                raise exception.InvalidVolume(
+                    reason="Volume requested is already is in user")
             admin_meta, model_update = self.use_existing(
                 volume['display_name'], metadata['softlayer_volume_id'])
             self._update(volume['id'], admin_meta)
@@ -86,9 +90,9 @@ class IscsiPool(api.SLClient):
         if len(items) == 0:
             LOG.error(_("No item found for size %s" % volume['size']))
             raise VolumeBackendAPIException(
-                data="iSCSI storage of %sGB size is not supported by SoftLayer." %
-                volume['size'])
-        LOG.debug(_("%d items found for size %s" % (len(items), volume['size'])))
+                data="iSCSI storage of %sGB size is not supported by SoftLayer." % volume['size'])
+        LOG.debug(_("%d items found for size %s" % (len(items),
+                                                    volume['size'])))
         return self.order_iscsi(items, volume)
 
     def delete(self, volume):
@@ -101,7 +105,9 @@ class IscsiPool(api.SLClient):
         attach_info = self.parent._attch(connection)
         size_in_mb = 1024 * int(vol['capacityGb'])
 
-        if not self.configuration.sl_pool_volume_clear in ("zero", "shred", "none"):
+        if not self.configuration.sl_pool_volume_clear in ("zero",
+                                                           "shred",
+                                                           "none"):
             raise exception.InvalidConfigurationValue(
                 option='volume_clear',
                 value=self.configuration.sl_pool_volume_clear)
@@ -113,8 +119,9 @@ class IscsiPool(api.SLClient):
                     '/dev/zero', attach_info['device']['path'], size_in_mb)
             elif self.configuration.sl_pool_volume_clear == 'shred':
                 LOG.info("Shredding volume")
-                utils.execute('shred', '-n3', '-s%dMiB' %
-                              size_in_mb, attach_info['device']['path'], run_as_root=True)
+                utils.execute('shred', '-n3', '-s%dMiB' % size_in_mb,
+                              attach_info['device']['path'],
+                              run_as_root=True)
         except Exception as e:
             LOG.error(_("Error while swiping out data. %s" % e))
             raise VolumeBackendAPIException(
