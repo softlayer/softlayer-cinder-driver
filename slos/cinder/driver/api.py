@@ -9,7 +9,8 @@ from SoftLayer.exceptions import SoftLayerAPIError
 from cinder import db
 from cinder import context
 from cinder.openstack.common import log as logging
-from cinder.exception import VolumeBackendAPIException, InvalidSnapshot
+from cinder.exception import (
+    VolumeBackendAPIException, InvalidSnapshot, InvalidInput, InvalidResult)
 from cinder.openstack.common import lockutils
 
 LOG = logging.getLogger(__name__)
@@ -19,8 +20,8 @@ class SLClient(object):
 
     def __init__(self, configuration={}, parent=None):
         self.configuration = configuration
-        self.client = SoftLayer.Client(
-            username=configuration.sl_username, api_key=self.configuration.sl_api_key)
+        self.client = SoftLayer.Client(username=configuration.sl_username,
+                                       api_key=self.configuration.sl_api_key)
         self.parent = parent
         self.product_order = self.client['Product_Order']
 
@@ -34,12 +35,11 @@ class SLClient(object):
         err_msg = (_('Invalid username password and datacenter '
                      'combination. Valid usename and api_key'
                      ' along with datacenter location must be specified.'))
-        raise exception.InvalidInput(reason=err_msg)
+        raise InvalidInput(reason=err_msg)
 
     def _update(self, _id, admin_meta):
         admin_context = context.get_admin_context()
-        db.volume_admin_metadata_update(
-                admin_context, _id, admin_meta, False)
+        db.volume_admin_metadata_update(admin_context, _id, admin_meta, False)
 
     def find_items(self, size):
         items = []
@@ -69,7 +69,9 @@ class SLClient(object):
         return items
 
     def create_updates(self, sl_vol_id):
-        sl_vol = self.find_volume(sl_vol_id, mask='mask[id,capacityGb,username,password,billingItem[id]]')
+        sl_vol = self.find_volume(
+            sl_vol_id,
+            mask='mask[id,capacityGb,username,password,billingItem[id]]')
         meta_update = {'id': sl_vol['id'],
                        'billing_item_id': sl_vol['billingItem']['id'],
                        'username': sl_vol['username'],
@@ -80,7 +82,8 @@ class SLClient(object):
 
     def use_existing(self, name, sl_vol_id):
         sl_vol_id = int(sl_vol_id)
-        sl_vol = self.find_volume(sl_vol_id, mask='mask=[username,password,id,capacityGb]')
+        sl_vol = self.find_volume(
+            sl_vol_id, mask='mask=[username,password,id,capacityGb]')
         admin_meta = {}
         admin_meta['username'] = sl_vol['username']
         admin_meta['password'] = sl_vol['password']
@@ -188,7 +191,7 @@ class SLClient(object):
                     id=int(sl_vol_id),
                     mask=mask)
             )
-        except Exception as e:
+        except Exception:
             raise VolumeBackendAPIException(
                 data='Softlayer volume id %s did not found' %
                 sl_vol_id)
@@ -201,8 +204,7 @@ class SLClient(object):
         host_device = device['path']
         if not connector.check_valid_device(host_device):
             #raise exception.DeviceUnavailable(device=host_device)
-            raise exception.InvalidResult(
-                "Unable to get valid device %s" % host_device)
+            raise InvalidResult("Unable to get valid device %s" % host_device)
         return {'conn': conn, 'device': device, 'connector': connector}
 
     def _get_metadata(self, _id):
@@ -224,7 +226,7 @@ class SLClient(object):
         "Raises ticket to cancel volume"
         sl_vol = self.get_sl_volume(volume)
         if not sl_vol:
-            LOG.warn("Corosponding volume for %s did not found. Assumming already deleted." % volume['id'])
+            LOG.warn("Corresponding volume for %s did not found. Assumming already deleted." % volume['id'])
             return
         self.setNotes(
             sl_vol['id'],
@@ -259,8 +261,8 @@ class SLClient(object):
                           'password'],
                       '/etc/iscsi/iscsid.conf',
                       run_as_root=True)
-        (out, err) = utils.execute('iscsiadm', '-m', 'discovery', '-t', 'st', '-p',
-                                   sl_vol['serviceResourceBackendIpAddress'], '-o', 'new', run_as_root=True)
+        out, err = utils.execute('iscsiadm', '-m', 'discovery', '-t', 'st', '-p',
+                                 sl_vol['serviceResourceBackendIpAddress'], '-o', 'new', run_as_root=True)
         if err and len(err) != 0:
             raise VolumeBackendAPIException(
                 data="Error while 'discovery' on iSCSI details. %s" % err)
@@ -357,7 +359,8 @@ class SLClient(object):
         return 'Insufficient snapshot reserve space to create a snapshot for the volume' in message
 
     def create_snapshot(self, sl_vol_id, snapshot):
-        vol = self.find_volume(sl_vol_id, mask='mask[capacityGb,snapshotCapacityGb]')
+        vol = self.find_volume(sl_vol_id,
+                               mask='mask[capacityGb,snapshotCapacityGb]')
         if vol['capacityGb'] == 1:
             raise VolumeBackendAPIException(
                 data="1 GB Snapshot is not supported")
