@@ -1,179 +1,305 @@
+"""
+Contains the Utilities required by SoftLayer Driver
+"""
+import copy
 import string
 import time
-import cinder.utils as utils
-import SoftLayer
 
-from SoftLayer.utils import query_filter, NestedDict
-from SoftLayer.exceptions import SoftLayerAPIError
+import cinder.exception as exception
+import cinder.utils as utils
 
 from cinder import db
 from cinder import context
-from cinder.openstack.common import log as logging
-from cinder.exception import (
-    VolumeBackendAPIException, InvalidSnapshot, InvalidInput, InvalidResult)
+from cinder.openstack.common.gettextutils import _
 from cinder.openstack.common import lockutils
+from cinder.openstack.common import log as logging
+
+import SoftLayer
+from SoftLayer.exceptions import SoftLayerAPIError
+from SoftLayer.utils import query_filter, NestedDict
 
 LOG = logging.getLogger(__name__)
 
 
-class SLClient(object):
+class MetadataManager(object):
+    """
+    Manages the admin metadata representation of
+    SoftLayer volumes.
+    """
 
-    def __init__(self, configuration={}, parent=None):
+    def _local_volume_references(self, cntx):
+        """
+        Get IDs of all volumes in Cinder.
+        """
+        all_vols = db.volume_get_all(
+            cntx, marker=None, limit=None,
+            sort_key='created_at', sort_dir='desc')
+        return [vol['id'] for vol in all_vols]
+
+    def all_imported(self):
+        """
+        Returns ID of all imported volumes
+        :returns: list of external vol's id
+        """
+        cntx = context.get_admin_context()
+        local_volumes = self._local_volume_references(cntx)
+        sl_volumes = []
+        for vol in local_volumes:
+            sl_vol = self.deserialize(vol)
+            if not sl_vol:
+                continue
+            sl_volumes.append(sl_vol['id'])
+        return sl_volumes
+
+    def get_all(self, vol_id):
+        """
+        Retrives the user metadata of the volume.
+
+        :param vol_id: OpenStack Volume ID.
+        """
+        admin_context = context.get_admin_context()
+        metadata = db.volume_admin_metadata_get(admin_context, vol_id)
+        return metadata
+
+    def deserialize(self, vol_id):
+        """
+        Convertes the database representation of the volume
+        into SoftLayer Volume object
+        """
+        meta = copy.deepcopy(self.get_all(vol_id))
+        if 'sl_id' not in meta:
+            return None
+        for int_field in ('sl_id', 'billing_item_id', 'capacityGb'):
+            meta[int_field] = int(meta[int_field])
+        meta['billingItem'] = {'id': meta.get('billing_item_id')}
+        meta['serviceResourceBackendIpAddress'] = meta['portal']
+        meta['id'] = meta['sl_id']
+        del meta['billing_item_id']
+        del meta['portal']
+        del meta['sl_id']
+        return meta
+
+    def serialize(self, vol_id, sl_vol):
+        """
+        Converts and stores the SoftLayer volume object
+        into database as admin metadata.
+        """
+        defaults = {
+            'sl_id': str(sl_vol['id']),
+            'billing_item_id': str(sl_vol['billingItem']['id']),
+            'portal': sl_vol['serviceResourceBackendIpAddress'],
+            'capacityGb': str(sl_vol['capacityGb']),
+            'username': sl_vol['username'],
+            'password': sl_vol['password'],
+        }
+        self.update_meta(vol_id, defaults)
+
+    def delete_all(self, vol_id):
+        """
+        Delete the admin_metadata created for given volume.
+
+        :param vol_id: OpenStack Volume ID.
+
+        """
+        admin_context = context.get_admin_context()
+        admin_meta = self.get_all(vol_id)
+        for key in admin_meta.keys():
+            db.volume_admin_metadata_delete(admin_context, vol_id, key)
+
+    def delete_entry(self, volume, entry):
+        """
+        Remove snapshot's ID from the volume's admin metadata
+
+        :param volume: OpenStack Volume Object.
+        :param entry: OpenStack Volume ID.
+        """
+        admin_context = context.get_admin_context()
+        metadata = db.volume_admin_metadata_get(admin_context, volume['id'])
+        if entry in metadata:
+            del metadata[entry]
+            db.volume_admin_metadata_update(
+                admin_context, volume['id'], metadata, delete=True)
+
+    def update_meta(self, _id, admin_meta):
+        """
+        Update the admin metadata
+        """
+        admin_context = context.get_admin_context()
+        db.volume_admin_metadata_update(
+            admin_context, _id, admin_meta, False)
+
+    def get(self, vol_id, entry):
+        """
+        Finds the corresponding SoftLayer SnapshotID of
+        given OpenStack Snapshot.
+
+        :param vol_id: OpenStack Volume ID.
+
+        """
+        admin_context = context.get_admin_context()
+        metadata = db.volume_admin_metadata_get(admin_context, vol_id)
+        return metadata.get(entry, None)
+
+    def get_user_meta(self, vol_id):
+        """
+        Retrive the user metadata of the volume.
+
+        :param vol_id: OpenStack Volume ID.
+        """
+        admin_context = context.get_admin_context()
+        metadata = db.volume_metadata_get(admin_context, vol_id)
+        return metadata
+
+    def update_user_meta(self, vol_id, metadata, delete=False):
+        """
+        Update the user metadata of the given volume
+
+        :param vol_id: OpenStack volume ID.
+        :param metadata: dict containing metadata to be updated
+        :param delete: True if update should result in deletion of existing
+        """
+        admin_context = context.get_admin_context()
+        db.volume_metadata_update(admin_context, vol_id,
+                                  metadata, delete)
+
+
+class IscsiVolumeManager(object):
+
+    """
+    Cinder Driver for SoftLayer helper module
+    """
+
+    def __init__(self, configuration={}):
         self.configuration = configuration
-        self.client = SoftLayer.Client(username=configuration.sl_username,
-                                       api_key=self.configuration.sl_api_key)
-        self.parent = parent
+        self.client = SoftLayer.Client(
+            username=configuration.sl_username,
+            api_key=self.configuration.sl_api_key)
         self.product_order = self.client['Product_Order']
+        self.location = None
 
     def check_dc(self):
+        """
+        Varify the datacenter name in config.
+        """
         datacenters = self.client['Location_Datacenter'].getDatacenters(
-            mask='mask[longName,id]')
-        for dc in datacenters:
-            if dc['longName'] == self.configuration.sl_datacenter:
-                self.location = dc['id']
+            mask='mask[name,id]')
+        for datacenter in datacenters:
+            if datacenter['name'] == self.configuration.sl_datacenter:
+                self.location = datacenter['id']
                 return
         err_msg = (_('Invalid username password and datacenter '
                      'combination. Valid usename and api_key'
                      ' along with datacenter location must be specified.'))
-        raise InvalidInput(reason=err_msg)
+        raise exception.InvalidInput(reason=err_msg)
 
-    def _update(self, _id, admin_meta):
-        admin_context = context.get_admin_context()
-        db.volume_admin_metadata_update(admin_context, _id, admin_meta, False)
+    def _find_item(self, size, category_code, ceil):
+        """
+        Find the item_price IDs for the iSCSIs of given size
 
-    def find_items(self, size):
-        items = []
+        :param int size: iSCSI volume size
+        :returns: Returns a list of item price IDs matching
+                  the given volume size or first large enough size, if the
+                 `sl_vol_order_ceil` configuration value is se
+        """
         _filter = NestedDict({})
         _filter[
-            'itemPrices'][
-            'item'][
-            'description'] = query_filter(
-            '~GB iSCSI SAN Storage')
-        if self.configuration.sl_vol_order_ceil:
-            _filter['itemPrices']['item'][
+            'items'][
+            'categories'][
+            'categoryCode'] = query_filter(category_code)
+        if ceil:
+            _filter['items'][
                 'capacity'] = query_filter('>=%s' % size)
         else:
-            _filter['itemPrices']['item']['capacity'] = query_filter(size)
-        iscsi_item_prices = self.client['Product_Package'].getItemPrices(
+            _filter['items']['capacity'] = query_filter(size)
+        iscsi_item_prices = self.client['Product_Package'].getItems(
             id=0,
-            mask='mask[id,recurringFee,item[capacity]]',
+            mask=','.join(('id', 'prices', 'capacity')),
             filter=_filter.to_dict())
+        if len(iscsi_item_prices) == 0:
+            return None
         iscsi_item_prices = sorted(
             iscsi_item_prices,
-            key=lambda x: float(x.get('recurringFee', 0)))
-        iscsi_item_prices = sorted(
-            iscsi_item_prices,
-            key=lambda x: float(x['item']['capacity']))
-        for price in iscsi_item_prices:
-            items.append(price['id'])
-        return items
+            key=lambda x: float(x['capacity']))
 
-    def create_updates(self, sl_vol_id):
-        sl_vol = self.find_volume(
-            sl_vol_id,
-            mask='mask[id,capacityGb,username,password,billingItem[id]]')
-        meta_update = {'id': sl_vol['id'],
-                       'billing_item_id': sl_vol['billingItem']['id'],
-                       'username': sl_vol['username'],
-                       'password': sl_vol['password']}
-        model_update = {'size': sl_vol['capacityGb'],
-                        'display_name': sl_vol['username']}
-        return (meta_update, model_update)
-
-    def use_existing(self, name, sl_vol_id):
-        sl_vol_id = int(sl_vol_id)
-        sl_vol = self.find_volume(
-            sl_vol_id, mask='mask=[username,password,id,capacityGb]')
-        admin_meta = {}
-        admin_meta['username'] = sl_vol['username']
-        admin_meta['password'] = sl_vol['password']
-        admin_meta['id'] = sl_vol_id
-        os_model = {}
-        os_model['size'] = sl_vol['capacityGb']
-        os_model['display_name'] = sl_vol['username']
-        self.setNotes(sl_vol_id, name=name)
-        if int(model_update['size']) == int(size):
-            # User has request volume of same size of the id specified.
-            return (admin_meta, model_update)
-        # size mismatch
-        raise exception.InvalidVolume(
-            reason="Requested SL volume (%s) size doesn't match."
-            " SL size %s, requested size %s" % (admin_meta['id'], model_update['size'], size))
+        return iscsi_item_prices[0]['prices'][0]['id']
 
     def create_volume(self, volume):
+        """
+        Creates a new volume on the SoftLayer account.
+
+        :param volume: OpenStack Volume Object.
+        :returns: returns admin metadata and volume model_update which
+                  can be used by the driver and manager respectively
+                  to update volume's information.
+        """
         LOG.debug(
             _("Create volume called with name: %s, size: %s, id: %s" %
               (volume['display_name'], volume['size'], volume['id'])))
-        items = self.find_items(volume['size'])
-        if len(items) == 0:
+        item = self._find_item(volume['size'],
+                               'iscsi',
+                               self.configuration.sl_vol_order_ceil)
+        if not item:
             LOG.error(_("No item found for size %s" % volume['size']))
-            raise VolumeBackendAPIException(
+            raise exception.VolumeBackendAPIException(
                 data="iSCSI storage of %s size is not supported" %
-                size)
-        LOG.debug(_("%d items found for size %s" % (len(items), volume['size'])))
-        return self.order_iscsi(items, volume)
+                volume['size'])
+        return self._order_iscsi(item)
 
-    def order_iscsi(self, items, volume):
-        for item in items:
-            admin_meta = {}
-            iscsi_order = self.build_order(item, volume['display_name'])
-            try:
-                self.product_order.verifyOrder(iscsi_order)
-                LOG.debug(_("Order verified successfully"))
-                order = self.product_order.placeOrder(iscsi_order)
-            except Exception as e:
-                LOG.debug(_("Cannot place order: %s" % e))
-                continue
-            LOG.debug(_("Order placed successfully"))
-            billing_item_id = order['placedOrder']['items'][0]['id']
-            LOG.debug(_("Billing item id: %s associated" % billing_item_id))
-            retry = self.configuration.sl_vol_active_retry
-            billingOrderItemService = self.client['Billing_Order_Item']
-            billing_item = billingOrderItemService.getBillingItem(
-                id=billing_item_id)
-            while True:
-                if retry == 0:
-                    raise VolumeBackendAPIException(
-                        data="Unable to retrive the billing item for the order placed. Order Id: %s" %
-                        order['id'])
-                retry = retry - 1
-                LOG.debug(_("Sleeping for 10 sec"))
-                time.sleep(10)
-                billing_item = billingOrderItemService.getBillingItem(
-                    id=billing_item_id)
-                if not isinstance(billing_item, type({})):
-                    continue
-                if not billing_item.get('notes'):
-                    continue
-                break
-            LOG.debug(_("Billing Item associated: '%s'" % billing_item))
-            user_name = billing_item['notes']
-            _filter = NestedDict({})
-            _filter[
-                'iscsiNetworkStorage'][
-                'username'] = query_filter(
-                user_name)
-            result = self.client['Account'].getIscsiNetworkStorage(
-                mask='mask[id,capacityGb]',
-                filter=_filter.to_dict())
-            sl_vol_id = result[0]['id']
-            admin_meta, os_model = self.create_updates(sl_vol_id)
-            self.setNotes(sl_vol_id, name=volume['id'])
-            self._update(volume['id'], admin_meta)
-            os_model['admin_meta'] = admin_meta
-            return os_model
-        raise VolumeBackendAPIException(
-            data="Item for given size cannot be found")
+    def _order_iscsi(self, item):
+        """
+        Places an order for volume.
 
-    def setNotes(self, sl_vol_id, **notes):
+        :param item: item price id to be used to order
+        """
+        iscsi_order = self._build_order(item)
         try:
-            self.client['Network_Storage_Iscsi'].editObject(
-                {'notes': str(notes)},
-                id=int(sl_vol_id))
-        except:
-            LOG.error(_("Unable to edit notes for the iSCSI %s" % sl_vol_id))
+            self.product_order.verifyOrder(iscsi_order)
+            LOG.debug(_("Order verified successfully"))
+            order = self.product_order.placeOrder(iscsi_order)
+        except SoftLayerAPIError as ex:
+            LOG.debug(_("Cannot place order: %s" % ex))
+            raise exception.VolumeBackendAPIException(data=ex.message)
+        LOG.debug(_("Order placed successfully"))
+        billing_item_id = order['placedOrder']['items'][0]['id']
+        LOG.debug(_("Billing item id: %s associated" % billing_item_id))
+        billing_svc = self.client['Billing_Order_Item']
+        for retry in xrange(self.configuration.sl_vol_active_retry):
+            billing_item = billing_svc.getBillingItem(
+                id=billing_item_id)
+            if billing_item and \
+                    billing_item.get('notes'):
+                # iscsi is available
+                break
+            LOG.debug("Ordered volume is not in active state, "
+                      "sleeping after %s retries" % retry)
+            time.sleep(self.configuration.sl_vol_active_wait)
 
-    def build_order(self, item, name):
+        if not billing_item.get('notes'):
+            raise exception.VolumeBackendAPIException(
+                data="Unable to retrive the "
+                "billing item for the order placed. "
+                "Order Id: %s" %
+                order.get('id'))
+        LOG.debug(_("Billing Item associated: '%s'" % billing_item))
+        user_name = billing_item['notes']
+        _filter = NestedDict({})
+        _filter[
+            'iscsiNetworkStorage'][
+            'username'] = query_filter(
+            user_name)
+        result = self.client['Account'].\
+            getIscsiNetworkStorage(mask='mask[billingItem[id]]',
+                                   filter=_filter.to_dict())
+        sl_vol = result[0]
+        return sl_vol
+
+    def _build_order(self, item):
+        """
+        Build order structure required by placeOrder
+
+        :param: int item: item price ID to be ordered
+        :returns: the dict required by the `placeOrder`
+        """
         order = {
             'complexType':
             'SoftLayer_Container_Product_Order_Network_Storage_Iscsi',
@@ -184,68 +310,41 @@ class SLClient(object):
         }
         return order
 
-    def find_volume(self, sl_vol_id, mask='mask[billingItem[id]]'):
+    def _get_vol(self, sl_vol_id, mask='mask[billingItem[id]]'):
+        """
+        Search the SoftLayer volume object using ID
+
+        :param sl_vol_id: SoftLayer iSCSI volume ID.
+        :param mask: fields from the volume to be retrived
+        """
         try:
             return (
                 self.client['Network_Storage_Iscsi'].getObject(
                     id=int(sl_vol_id),
                     mask=mask)
             )
-        except Exception:
-            raise VolumeBackendAPIException(
+        except SoftLayerAPIError:
+            raise exception.VolumeBackendAPIException(
                 data='Softlayer volume id %s did not found' %
                 sl_vol_id)
 
-    def _attch(self, conn):
-        protocol = conn['driver_volume_type']
-        LOG.debug("Attaching for protocol '%s'" % protocol)
-        connector = utils.brick_get_connector(protocol)
-        device = connector.connect_volume(conn['data'])
-        host_device = device['path']
-        if not connector.check_valid_device(host_device):
-            #raise exception.DeviceUnavailable(device=host_device)
-            raise InvalidResult("Unable to get valid device %s" % host_device)
-        return {'conn': conn, 'device': device, 'connector': connector}
-
-    def _get_metadata(self, _id):
-        admin_context = context.get_admin_context()
-        metadata = db.volume_admin_metadata_get(admin_context, _id)
-        return metadata
-
-    def _delete_metadata(self, _id):
-        admin_context = context.get_admin_context()
-        admin_meta = self._get_metadata(_id)
-        for key in admin_meta.keys():
-            db.volume_admin_metadata_delete(admin_context, _id, key)
-
-    def get_sl_volume(self, volume, mask='mask[id,capacityGb,username,password,billingItem[id]]'):
-        sl_id = self._find_sl_vol_id(volume['id'])
-        return self.find_volume(sl_id, mask)
-
-    def delete(self, volume):
-        "Raises ticket to cancel volume"
-        sl_vol = self.get_sl_volume(volume)
-        if not sl_vol:
-            LOG.warn("Corresponding volume for %s did not found. Assumming already deleted." % volume['id'])
-            return
-        self.setNotes(
-            sl_vol['id'],
-            status="DELETED. No Billing Item is associated "
-                "with this volume. Will be invisible after few hours.")
-        if not sl_vol.get('billingItem'):
-            LOG.error(
-                _("Billing Item not found for the volume. Assumeing volume is already canceled."))
-            return
-        billingItemId = sl_vol['billingItem']['id']
-        self.client['SoftLayer_Billing_Item'].cancelItem(
+    def cancel(self, sl_vol):
+        """
+        Cancels a given iSCSI target.
+        """
+        billing_item_id = sl_vol['billingItem']['id']
+        self.client['Billing_Item'].cancelItem(
             True,
             False,
             "No longer needed",
-            id=billingItemId)
-        self._delete_metadata(volume['id'])
+            id=billing_item_id)
 
-    @lockutils.synchronized('getdetails', 'cinder-', False)
-    def get_details(self, sl_vol):
+    @lockutils.synchronized('run_iscsiadm', 'cinder-', False)
+    def run_iscsiadm(self, sl_vol):
+        """
+        Run `iscsiadm` command on SoftLayer iSCSI target
+        to fetch IQN and other details of the target.
+        """
         # modify the iscsid.conf
         # first remove and then insert, makes sure we always will have new
         # values placed, even if there isn't any existing values.
@@ -261,155 +360,215 @@ class SLClient(object):
                           'password'],
                       '/etc/iscsi/iscsid.conf',
                       run_as_root=True)
-        out, err = utils.execute('iscsiadm', '-m', 'discovery', '-t', 'st', '-p',
-                                 sl_vol['serviceResourceBackendIpAddress'], '-o', 'new', run_as_root=True)
+        (out, err) = utils.execute(
+            'iscsiadm', '-m', 'discovery', '-t', 'st', '-p',
+            sl_vol['serviceResourceBackendIpAddress'],
+            '-o', 'new', run_as_root=True)
         if err and len(err) != 0:
-            raise VolumeBackendAPIException(
+            raise exception.VolumeBackendAPIException(
                 data="Error while 'discovery' on iSCSI details. %s" % err)
         return out
 
-    def build_data(self, details, sl_vol):
-        result = details.split(' ')
-        dict = {}
-        dict['driver_volume_type'] = 'iscsi'
+    def _create_properties(self, iscsi_detail, sl_vol):
+        """
+        Build properties data from the volume detail.
+        """
+        result = iscsi_detail.split(' ')
+        data = {}
+        data['driver_volume_type'] = 'iscsi'
         properties = {}
-        properties['target_discovered'] = False
+        properties['target_discovered'] = True
         properties['encrypted'] = False
         properties['target_iqn'] = string.strip(result[1])
         properties['target_portal'] = string.strip(result[0].split(',')[0])
         properties['volume_id'] = sl_vol['id']
-        try:
+        if len(result) > 2:
             properties['target_lun'] = int(result[2])
-        except (IndexError, ValueError):
+        else:
             properties['target_lun'] = 0
 
         properties['auth_password'] = sl_vol['password']
         properties['auth_username'] = sl_vol['username']
         properties['auth_method'] = u'CHAP'
-        dict['data'] = properties
-        return dict
-
-    def get_export(self, sl_vol_id):
-        sl_vol = self.find_volume(sl_vol_id)
-        details = self.get_details(sl_vol)
-        return details
-
-    def _find_sl_vol_id(self, vol_id):
-        admin_context = context.get_admin_context()
-        metadata = db.volume_admin_metadata_get(admin_context, vol_id)
-        return metadata.get('id', None)
-
-    def find_space(self, size):
-        _filter = NestedDict({})
-        _filter[
-            'itemPrices'][
-            'item'][
-            'description'] = query_filter(
-            '~iSCSI SAN Snapshot Space')
-        _filter['itemPrices']['item']['capacity'] = query_filter('>=%s' % size)
-        item_prices = self.client['Product_Package'].getItemPrices(
-            id=0,
-            mask='mask[id,item[capacity]]',
-            filter=_filter.to_dict())
-        LOG.debug(_("Finding item prices"))
-        item_prices = sorted(
-            item_prices,
-            key=lambda x: int(x['item']['capacity']))
-        LOG.debug(_("Item prices found: %s" % item_prices))
-        if len(item_prices) == 0:
-            return None
-        return item_prices[0]['id']
+        data['data'] = properties
+        return data
 
     def increase_snapshot_space(self, sl_vol_id, capacity):
-        item_price = self.find_space(capacity)
+        """
+        Increase the snapshot space to given capacity
+        """
+        item_price = self._find_item(capacity, 'iscsi_snapshot_space', True)
         if not item_price:
-            raise VolumeBackendAPIException(
+            raise exception.VolumeBackendAPIException(
                 data="Snapshot space having size %s not found." % capacity)
-        snapshotSpaceOrder = {
+        snap_space_order = {
             'complexType':
-            'SoftLayer_Container_Product_Order_Network_Storage_Iscsi_SnapshotSpace',
+            'SoftLayer_Container_Product_Order_'
+            'Network_Storage_Iscsi_SnapshotSpace',
             'location': self.location,
             'packageId': 0,
             'prices': [{'id': item_price}],
             'quantity': 1,
             'volumeId': sl_vol_id}
         try:
-            self.product_order.verifyOrder(snapshotSpaceOrder)
+            self.product_order.verifyOrder(snap_space_order)
             LOG.debug(_("Order verified successfully"))
-            order = self.product_order.placeOrder(snapshotSpaceOrder)
-        except Exception as e:
-            LOG.debug(_("Cannot place order: %s" % e))
-            raise VolumeBackendAPIException(data=e.message)
+            self.product_order.placeOrder(snap_space_order)
+        except SoftLayerAPIError as ex:
+            LOG.debug(_("Cannot place order: %s" % ex.message))
+            raise exception.VolumeBackendAPIException(data=ex.message)
 
-    def waitForSpace(self, sl_vol_id, retryLimit, currentCapacity, sleep=5):
-        noSpace = True
-        while retryLimit and noSpace:
-            time.sleep(5)
+    def _wait_for_space(self,
+                        sl_vol_id,
+                        retry_limit,
+                        current_capacity, sleep=5):
+        """
+        Wait for snapshot space to become available.
+        """
+        space_allocated = False
+        for retry in xrange(retry_limit):
             vol = self.client['Network_Storage_Iscsi'].getObject(
                 id=sl_vol_id,
                 mask='mask[snapshotCapacityGb]')
-            newCapacity = int(vol.get('snapshotCapacityGb', '0'))
-            noSpace = newCapacity <= currentCapacity
-            retryLimit = retryLimit - 1
-        if not retryLimit:
-            raise VolumeBackendAPIException(
+            new_capacity = int(vol.get('snapshotCapacityGb', '0'))
+            space_allocated = new_capacity > current_capacity
+            if space_allocated:
+                break
+            LOG.debug("Snapshot space not activated, "
+                      "sleeping after %s retries" % retry)
+            time.sleep(sleep)
+        if not space_allocated:
+            raise exception.VolumeBackendAPIException(
                 data="Unable to reserve space for volume.")
 
     def space_needed(self, message):
-        return 'Insufficient snapshot reserve space to create a snapshot for the volume' in message
+        """
+        Check if the error message from SoftLayer is
+        related to insufficent space.
+        """
+        return \
+            'Insufficient snapshot reserve space to ' \
+            'create a snapshot for the volume' in message
 
-    def create_snapshot(self, sl_vol_id, snapshot):
-        vol = self.find_volume(sl_vol_id,
-                               mask='mask[capacityGb,snapshotCapacityGb]')
-        if vol['capacityGb'] == 1:
-            raise VolumeBackendAPIException(
+    def create_snapshot(self, sl_vol, snapshot):
+        """
+        Create snapshot for volume, if required inflate the snapshot space.
+        """
+        sl_vol = self._get_vol(sl_vol['id'])
+        if sl_vol['capacityGb'] == 1:
+            raise exception.VolumeBackendAPIException(
                 data="1 GB Snapshot is not supported")
         try:
             sl_snapshot = self.client['Network_Storage_Iscsi'].createSnapshot(
                 '',
-                id=sl_vol_id)
-        except SoftLayerAPIError as e:
-            LOG.error(_("Unable to create snapshot of the given volume."))
-            if self.space_needed(e.message) and self.configuration.sl_order_snap_space:
-                LOG.info(
-                    _("Increasing the snapshot space of the softlayer volume %s" % sl_vol_id))
-                currentCapacity = vol.get('snapshotCapacityGb', 0)
-                if currentCapacity == 0:
-                    self.increase_snapshot_space(sl_vol_id, vol['capacityGb'])
-                else:
-                    self.increase_snapshot_space(
-                        sl_vol_id,
-                        currentCapacity +
-                        1)
-                retryLimit = 30
-                self.waitForSpace(sl_vol_id, retryLimit, currentCapacity)
-                # space increased try creating snapshot again.
-                return self.create_snapshot(sl_vol_id, snapshot)
+                id=sl_vol['id'])
+        except SoftLayerAPIError as ex:
+            if not self.space_needed(ex.message) or \
+                    not self.configuration.sl_order_snap_space:
+                LOG.error(_("Unable to create snapshot of the given volume."))
+                raise exception.VolumeBackendAPIException(
+                    data="Unable to create snapshot. %s" % ex.message)
+
+            LOG.info(
+                _("Increasing the snapshot space "
+                  "of the softlayer volume %s" % sl_vol['id']))
+            current_capacity = sl_vol.get('snapshotCapacityGb', 0)
+            if current_capacity == 0:
+                self.increase_snapshot_space(sl_vol['id'],
+                                             sl_vol['capacityGb'])
             else:
-                raise VolumeBackendAPIException(
-                    data="Unable to create snapshot. %s" % e.message)
-        model_update = {}
-        if sl_snapshot.get('username', None):
-            model_update['display_name'] = sl_snapshot.get('username', '')
-        meta_update = {}
-        meta_update[snapshot['id']] = sl_snapshot.get('id')
-        self._update(snapshot['volume']['id'], meta_update)
-        return model_update
+                self.increase_snapshot_space(
+                    sl_vol['id'],
+                    current_capacity +
+                    1)
+            retry_limit = self.configuration.sl_snap_space_active_retry
+            sleep = self.configuration.sl_snap_space_active_wait
+            self._wait_for_space(sl_vol['id'],
+                                 retry_limit,
+                                 current_capacity,
+                                 sleep=sleep)
+            # space increased try creating snapshot again.
+            return self.create_snapshot(sl_vol, snapshot)
+        return sl_snapshot
+
+    def restore_snapshot(self, sl_snap_id, sl_volume):
+        """
+        restore the volume to snapshot state
+        """
+        self.client['Network_Storage_Iscsi'].\
+            restoreFromSnapshot(sl_snap_id,
+                                id=sl_volume['id'])
 
     def delete_snapshot(self, snap_id):
+        """
+        Delete the snapshot
+        """
         if not snap_id:
-            raise InvalidSnapshot(
+            raise exception.InvalidSnapshot(
                 "Snapshot not fond on the SoftLayer account.")
         try:
             self.client[
-                'SoftLayer_Network_Storage_Iscsi'].deleteObject(
+                'Network_Storage_Iscsi'].deleteObject(
                 id=int(snap_id))
-        except Exception as e:
-            LOG.error(_("%s" % e.message))
-            raise VolumeBackendAPIException(_("%s" % e.message))
+        except SoftLayerAPIError as ex:
+            LOG.error(_("%s" % ex.message))
+            raise exception.VolumeBackendAPIException(_("%s" % ex.message))
 
-    def connect(self, sl_vol_id):
-        details = self.get_export(sl_vol_id)
-        sl_vol = self.find_volume(sl_vol_id)
-        self.setNotes(sl_vol_id, os_status='in-use')
-        return self.build_data(details, sl_vol)
+    def get_iscsi_properties(self, sl_vol):
+        """
+        Get the attachment details of the volume.
+        """
+        iscsi_detail = self.run_iscsiadm(sl_vol)
+        return self._create_properties(iscsi_detail, sl_vol)
+
+    def find_free_volume(self, size, imported):
+        """
+        Find a volume in the pool of the given size.
+
+        :param size: size to search for.
+        :param imported: list of imported volumes
+
+        :returns: sl_vol: SoftLayer iSCSI volume representation
+        """
+        _filter = NestedDict({})
+        if self.configuration.sl_vol_order_ceil:
+            _filter['iscsiNetworkStorage'][
+                'capacityGb'] = query_filter('>=%s' % size)
+        else:
+            _filter['iscsiNetworkStorage']['capacityGb'] = query_filter(size)
+        _filter['iscsiNetworkStorage'][
+            'billingItem'][
+            'location'][
+            'id'] = query_filter(self.location)
+        sl_volumes = self.client['Account'].getIscsiNetworkStorage(
+            mask='mask[id,capacityGb,'
+            'username,password,billingItem[id]]',
+            filter=_filter.to_dict())
+        if len(sl_volumes) == 0:
+            return None
+        sl_volumes = sorted(sl_volumes, key=lambda x: int(x['capacityGb']))
+        for sl_vol in sl_volumes:
+            if sl_vol['id'] in imported:
+                continue
+            return self._get_vol(sl_vol['id'])
+        LOG.warn(_("No free volume found of size %s" % size))
+        return None
+
+    def use_exiting(self, size, sl_vol_id):
+        """
+        Checks if given SL volume can be used
+
+        :param size: required volume size.
+        :param sl_vol_id: SoftLayer iSCSI volume ID.
+
+        :returns: sl_vol: SoftLayer iSCSI volume representation
+        """
+        sl_vol = self._get_vol(sl_vol_id)
+        if int(sl_vol['capacityGb']) == int(size):
+            # User has request volume of same size of the id specified.
+            return sl_vol
+        # size mismatch
+        raise exception.InvalidVolume(
+            reason="Requested SL volume (%s) size doesn't match."
+            " SL size %s, requested size %s" %
+            (sl_vol['id'], sl_vol['capacityGb'], size))

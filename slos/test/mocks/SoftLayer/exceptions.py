@@ -1,0 +1,3 @@
+
+class SoftLayerAPIError(Exception):
+    pass

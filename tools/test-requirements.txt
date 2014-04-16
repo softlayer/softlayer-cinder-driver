@@ -1,0 +1,5 @@
+tox
+nose
+mock
+coverage
+cinder

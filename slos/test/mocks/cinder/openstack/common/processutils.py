@@ -1,0 +1,4 @@
+
+
+class ProcessExecutionError(Exception):
+    pass
