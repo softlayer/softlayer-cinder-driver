@@ -1,5 +1,5 @@
 tox
 nose
 mock
+six
 coverage
-cinder
